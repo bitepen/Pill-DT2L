@@ -19,6 +19,7 @@ import android.view.ViewGroup;
 import android.view.WindowManager;
 
 import java.lang.ref.WeakReference;
+import java.lang.reflect.Method;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -32,14 +33,14 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String SYSTEMUI_PACKAGE = "com.android.systemui";
 
     private static final int STATE_IDLE = 0;
-    private static final int STATE_FIRST_DOWN = 1;
-    private static final int STATE_WAIT_SECOND_DOWN = 2;
+    private static final int STATE_WAIT_SECOND_DOWN = 1;
+    private static final int STATE_FIRST_DOWN = 2;
     private static final int STATE_SECOND_DOWN = 3;
 
     // PowerManager.GO_TO_SLEEP_REASON_POWER_BUTTON = 4
     private static final int GO_TO_SLEEP_REASON_POWER_BUTTON = 4;
 
-    // 单次点击最大按压时长（毫秒）：280ms 兼顾手感与防误触，且避开 400ms+ 的圈定即搜长按
+    // 单次点击最大按压时长（毫秒）：280ms 兼顾手感与防误触，且远小于圈定即搜 400ms+ 的长按阈值
     private static final long MAX_TAP_DURATION_MS = 280L;
 
     private int mState = STATE_IDLE;
@@ -60,12 +61,29 @@ public class MainHook implements IXposedHookLoadPackage {
     private volatile Context mAppContext;
     private WeakReference<ViewGroup> mNavBarRef = new WeakReference<>(null);
 
+    // 触摸容差与小白条预计算边界缓存（全程使用基本数据类型，零 GC）
     private boolean mConfigInitialized = false;
-    // 设置合理的默认初始容差，防止极端情况下 Context 尚未初始化时容差为 0
     private float mTouchSlopSq = 1200f;
     private float mDoubleTapSlopSq = 10000f;
     private long mDoubleTapTimeout = 300L;
     private float mBottomZoneHeightPx = 130f;
+
+    private int mCachedOrientation = Configuration.ORIENTATION_UNDEFINED;
+    private int mCachedScreenWidthDp = 0;
+    private float mPillLeft = 0f;
+    private float mPillRight = 0f;
+    private float mPillTop = 0f;
+    private float mPillBottom = 0f;
+
+    // 锁屏服务与反射方法缓存
+    private Object mWindowManagerService;
+    private Method mLockNowMethod;
+    private boolean mLockNowLookupDone = false;
+
+    private PowerManager mPowerManager;
+    private Method mGoToSleep3Method;
+    private Method mGoToSleep1Method;
+    private boolean mGoToSleepLookupDone = false;
 
     @Override
     public void handleLoadPackage(final LoadPackageParam lpparam) {
@@ -90,7 +108,7 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable ignored) {
         }
 
-        // 2. Hook SystemUI 内部全面屏手势核心类 EdgeBackGestureHandler（完美兼容 Android 15 类原生 ROM）
+        // 2. Hook SystemUI 全面屏手势核心类 EdgeBackGestureHandler（兼容 Pixel 与 Android 15 类原生 ROM）
         try {
             Class<?> edgeHandlerClass = XposedHelpers.findClassIfExists(
                     "com.android.systemui.navigationbar.gestural.EdgeBackGestureHandler",
@@ -110,23 +128,18 @@ public class MainHook implements IXposedHookLoadPackage {
                             } catch (Throwable ignored) {
                             }
                         }
-                        if (param.args != null && param.args.length > 0) {
-                            Object arg = param.args[0];
-                            if (arg instanceof MotionEvent) {
-                                observeMotionEvent((MotionEvent) arg);
-                            }
+                        if (param.args != null && param.args.length > 0 && param.args[0] instanceof MotionEvent) {
+                            observeMotionEvent((MotionEvent) param.args[0]);
                         }
                     }
                 };
                 XposedBridge.hookAllMethods(edgeHandlerClass, "onMotionEvent", edgeHook);
                 XposedBridge.hookAllMethods(edgeHandlerClass, "onInputEvent", edgeHook);
-                XposedBridge.log(TAG + ": Hooked EdgeBackGestureHandler");
             }
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + ": Failed to hook EdgeBackGestureHandler: " + t.getMessage());
+        } catch (Throwable ignored) {
         }
 
-        // 3. 捕获 NavigationBar 视图实例与触摸分发
+        // 3. 捕获首个匹配的 NavigationBar 视图实例（用于震动反馈与 Context 获取）
         String[] navBarClasses = new String[]{
                 "com.android.systemui.navigationbar.views.NavigationBarFrame",
                 "com.android.systemui.navigationbar.NavigationBarFrame",
@@ -146,65 +159,36 @@ public class MainHook implements IXposedHookLoadPackage {
                             }
                         }
                     });
-                } catch (Throwable ignored) {
-                }
-
-                try {
-                    XposedHelpers.findAndHookMethod(
-                            targetClass,
-                            "dispatchTouchEvent",
-                            MotionEvent.class,
-                            new XC_MethodHook() {
-                                @Override
-                                protected void beforeHookedMethod(MethodHookParam param) {
-                                    if (param.thisObject instanceof ViewGroup) {
-                                        recordNavBarInstance((ViewGroup) param.thisObject);
-                                        MotionEvent ev = (MotionEvent) param.args[0];
-                                        if (ev != null) {
-                                            observeMotionEvent(ev);
-                                        }
-                                    }
-                                }
-                            }
-                    );
+                    break;
                 } catch (Throwable ignored) {
                 }
             }
         }
 
-        // 4. Hook InputEventReceiver 及其子类（覆盖 dispatchInputEvent 与 onInputEvent）
-        String[] receiverClasses = new String[]{
-                "android.view.InputEventReceiver",
-                "android.view.BatchedInputEventReceiver",
-                "android.view.ViewRootImpl$WindowInputEventReceiver"
-        };
-
-        XC_MethodHook receiverHook = new XC_MethodHook() {
-            @Override
-            protected void beforeHookedMethod(MethodHookParam param) {
-                if (param.args == null) {
-                    return;
-                }
-                for (Object arg : param.args) {
-                    if (arg instanceof MotionEvent) {
-                        observeMotionEvent((MotionEvent) arg);
-                        break;
-                    } else if (arg instanceof InputEvent) {
-                        break;
+        // 4. Hook InputEventReceiver.dispatchInputEvent 作为通用底层事件入口
+        try {
+            Class<?> receiverClass = XposedHelpers.findClassIfExists(
+                    "android.view.InputEventReceiver", lpparam.classLoader);
+            if (receiverClass != null) {
+                XposedBridge.hookAllMethods(receiverClass, "dispatchInputEvent", new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        if (param.args == null) {
+                            return;
+                        }
+                        for (int i = 0, len = param.args.length; i < len; i++) {
+                            Object arg = param.args[i];
+                            if (arg instanceof MotionEvent) {
+                                observeMotionEvent((MotionEvent) arg);
+                                break;
+                            } else if (arg instanceof InputEvent) {
+                                break;
+                            }
+                        }
                     }
-                }
+                });
             }
-        };
-
-        for (String rClassName : receiverClasses) {
-            try {
-                Class<?> rClass = XposedHelpers.findClassIfExists(rClassName, lpparam.classLoader);
-                if (rClass != null) {
-                    XposedBridge.hookAllMethods(rClass, "dispatchInputEvent", receiverHook);
-                    XposedBridge.hookAllMethods(rClass, "onInputEvent", receiverHook);
-                }
-            } catch (Throwable ignored) {
-            }
+        } catch (Throwable ignored) {
         }
     }
 
@@ -219,9 +203,13 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private Context getContext(ViewGroup navBar) {
+    private Context getContext() {
         Context ctx = mAppContext;
-        if (ctx == null && navBar != null) {
+        if (ctx != null) {
+            return ctx;
+        }
+        ViewGroup navBar = mNavBarRef.get();
+        if (navBar != null) {
             ctx = navBar.getContext();
         }
         if (ctx == null) {
@@ -230,10 +218,11 @@ public class MainHook implements IXposedHookLoadPackage {
             } catch (Throwable ignored) {
             }
         }
-        if (ctx != null && mAppContext == null) {
+        if (ctx != null) {
             mAppContext = ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx;
+            initConfigIfNeeded(mAppContext);
         }
-        return ctx;
+        return mAppContext;
     }
 
     private void initConfigIfNeeded(Context context) {
@@ -250,7 +239,6 @@ public class MainHook implements IXposedHookLoadPackage {
         Resources res = context.getResources();
         if (res != null) {
             DisplayMetrics dm = res.getDisplayMetrics();
-            // 底部小白条纵向有效触发高度：42dp
             mBottomZoneHeightPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 42f, dm);
         }
         mConfigInitialized = true;
@@ -258,10 +246,17 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private void observeMotionEvent(MotionEvent ev) {
         int action = ev.getActionMasked();
+
+        // 【极速短路】平时滑动屏幕时 mState 为 STATE_IDLE（0）或 STATE_WAIT_SECOND_DOWN（1），
+        // 任何非 ACTION_DOWN 事件在第一行直接退出，不读取坐标或时间戳，实现 120Hz 滑动零开销
+        if (action != MotionEvent.ACTION_DOWN && mState <= STATE_WAIT_SECOND_DOWN) {
+            return;
+        }
+
         long downTime = ev.getDownTime();
         long eventTime = ev.getEventTime();
 
-        // 去重：防止同一事件在多个通道中被重复处理
+        // 去重：防止同一事件在多个通道中被重复统计
         if (action == mLastAction && downTime == mLastDownTime && eventTime == mLastEventTime) {
             return;
         }
@@ -269,15 +264,12 @@ public class MainHook implements IXposedHookLoadPackage {
         mLastDownTime = downTime;
         mLastEventTime = eventTime;
 
-        ViewGroup navBar = mNavBarRef.get();
-        Context ctx = getContext(navBar);
-        initConfigIfNeeded(ctx);
-
         float rawX = ev.getRawX();
         float rawY = ev.getRawY();
 
         switch (action) {
             case MotionEvent.ACTION_DOWN: {
+                Context ctx = getContext();
                 if (!isTouchOnPill(ctx, rawX, rawY)) {
                     resetState();
                     return;
@@ -332,8 +324,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     if (duration <= MAX_TAP_DURATION_MS
                             && distanceSq(rawX, rawY, mSecondDownX, mSecondDownY) <= mTouchSlopSq) {
                         resetState();
-                        XposedBridge.log(TAG + ": Double tap detected on pill, locking screen immediately.");
-                        triggerScreenLock(navBar, ctx);
+                        triggerScreenLock(getContext());
                     } else {
                         resetState();
                     }
@@ -343,7 +334,6 @@ public class MainHook implements IXposedHookLoadPackage {
 
             case MotionEvent.ACTION_OUTSIDE:
             case MotionEvent.ACTION_POINTER_DOWN: {
-                // 多指触控或超出边界时重置；不再因旁路通道的 ACTION_CANCEL 误清空正在进行的点击
                 resetState();
                 break;
             }
@@ -358,10 +348,29 @@ public class MainHook implements IXposedHookLoadPackage {
             return false;
         }
 
+        Resources res = ctx.getResources();
+        if (res == null) {
+            return false;
+        }
+
+        Configuration config = res.getConfiguration();
+        // 仅在首次运行或屏幕旋转/尺寸改变时更新一次小白条边界，日常点击零对象分配、零系统服务调用
+        if (mPillBottom <= 0f
+                || config.orientation != mCachedOrientation
+                || config.screenWidthDp != mCachedScreenWidthDp) {
+            updatePillBounds(ctx, res, config);
+        }
+
+        // Y 轴优先短路：98% 的日常屏幕点击都在底部导航栏上方，第一次比较即可立刻返回 false
+        return rawY >= mPillTop && rawY <= mPillBottom && rawX >= mPillLeft && rawX <= mPillRight;
+    }
+
+    private void updatePillBounds(Context ctx, Resources res, Configuration config) {
+        initConfigIfNeeded(ctx);
+
         float screenW = 0f;
         float screenH = 0f;
 
-        // 优先通过 WindowManager 获取包含导航栏在内的真实物理屏幕分辨率（修复 Android 15 下 heightPixels 偏小的问题）
         try {
             WindowManager wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
             if (wm != null) {
@@ -373,85 +382,82 @@ public class MainHook implements IXposedHookLoadPackage {
         }
 
         if (screenW <= 0f || screenH <= 0f) {
-            Resources res = ctx.getResources();
-            if (res == null) {
-                return false;
-            }
             DisplayMetrics dm = res.getDisplayMetrics();
             screenW = dm.widthPixels;
             screenH = dm.heightPixels;
         }
 
-        boolean isPortrait = screenH >= screenW;
-        try {
-            isPortrait = ctx.getResources().getConfiguration().orientation == Configuration.ORIENTATION_PORTRAIT;
-        } catch (Throwable ignored) {
-        }
-
-        // 横向严格限制在屏幕正中央的小白条视觉宽度内（竖屏 38% ~ 62%，横屏 40% ~ 60%）
+        boolean isPortrait = config.orientation == Configuration.ORIENTATION_PORTRAIT || screenH >= screenW;
         float leftRatio = isPortrait ? 0.38f : 0.40f;
         float rightRatio = isPortrait ? 0.62f : 0.60f;
 
-        float left = screenW * leftRatio;
-        float right = screenW * rightRatio;
-        float top = screenH - mBottomZoneHeightPx;
-        float bottom = screenH;
+        mPillLeft = screenW * leftRatio;
+        mPillRight = screenW * rightRatio;
+        mPillTop = screenH - mBottomZoneHeightPx;
+        mPillBottom = screenH;
 
-        return rawX >= left && rawX <= right && rawY >= top && rawY <= bottom;
+        mCachedOrientation = config.orientation;
+        mCachedScreenWidthDp = config.screenWidthDp;
     }
 
-    private void triggerScreenLock(View view, Context ctx) {
-        if (view != null) {
+    private void triggerScreenLock(Context ctx) {
+        ViewGroup navBar = mNavBarRef.get();
+        if (navBar != null) {
             try {
-                view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK);
+                navBar.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK);
             } catch (Throwable ignored) {
             }
         }
 
         if (ctx == null) {
-            ctx = getContext(null);
-        }
-        if (ctx == null) {
-            XposedBridge.log(TAG + ": Cannot lock screen because Context is null.");
             return;
         }
 
-        // 第一步：通知 WindowManager 立即上锁 Keyguard（保留指纹与生物识别解锁）
+        // 第一步：调用缓存的 WindowManager.lockNow(null) 立即锁定 Keyguard（保留指纹与生物识别）
         try {
-            ClassLoader cl = ctx.getClassLoader();
-            Class<?> wmgClass = XposedHelpers.findClassIfExists("android.view.WindowManagerGlobal", cl);
-            if (wmgClass != null) {
-                Object wms = XposedHelpers.callStaticMethod(wmgClass, "getWindowManagerService");
-                if (wms != null) {
-                    XposedHelpers.callMethod(wms, "lockNow", new Class<?>[]{Bundle.class}, (Object) null);
+            if (!mLockNowLookupDone) {
+                Class<?> wmgClass = XposedHelpers.findClassIfExists(
+                        "android.view.WindowManagerGlobal", ctx.getClassLoader());
+                if (wmgClass != null) {
+                    mWindowManagerService = XposedHelpers.callStaticMethod(wmgClass, "getWindowManagerService");
+                    if (mWindowManagerService != null) {
+                        mLockNowMethod = XposedHelpers.findMethodExactIfExists(
+                                mWindowManagerService.getClass(), "lockNow", Bundle.class);
+                    }
                 }
+                mLockNowLookupDone = true;
             }
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + ": Failed to call WindowManager.lockNow: " + t.getMessage());
+            if (mWindowManagerService != null && mLockNowMethod != null) {
+                mLockNowMethod.invoke(mWindowManagerService, (Object) null);
+            }
+        } catch (Throwable ignored) {
         }
 
-        // 第二步：以按下电源键的原因 (GO_TO_SLEEP_REASON_POWER_BUTTON = 4) 立即熄屏休眠
-        PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
-        if (pm == null) {
-            return;
-        }
-
-        long now = SystemClock.uptimeMillis();
+        // 第二步：调用缓存的 PowerManager.goToSleep 立即熄屏
         try {
-            XposedHelpers.callMethod(
-                    pm,
-                    "goToSleep",
-                    new Class<?>[]{long.class, int.class, int.class},
-                    now,
-                    GO_TO_SLEEP_REASON_POWER_BUTTON,
-                    0
-            );
-        } catch (Throwable t1) {
-            try {
-                XposedHelpers.callMethod(pm, "goToSleep", now);
-            } catch (Throwable t2) {
-                XposedBridge.log(TAG + ": Failed to call goToSleep: " + t2.getMessage());
+            if (mPowerManager == null) {
+                mPowerManager = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
             }
+            if (mPowerManager == null) {
+                return;
+            }
+            if (!mGoToSleepLookupDone) {
+                mGoToSleep3Method = XposedHelpers.findMethodExactIfExists(
+                        PowerManager.class, "goToSleep", long.class, int.class, int.class);
+                if (mGoToSleep3Method == null) {
+                    mGoToSleep1Method = XposedHelpers.findMethodExactIfExists(
+                            PowerManager.class, "goToSleep", long.class);
+                }
+                mGoToSleepLookupDone = true;
+            }
+
+            long now = SystemClock.uptimeMillis();
+            if (mGoToSleep3Method != null) {
+                mGoToSleep3Method.invoke(mPowerManager, now, GO_TO_SLEEP_REASON_POWER_BUTTON, 0);
+            } else if (mGoToSleep1Method != null) {
+                mGoToSleep1Method.invoke(mPowerManager, now);
+            }
+        } catch (Throwable ignored) {
         }
     }
 
