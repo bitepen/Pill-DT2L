@@ -1,0 +1,19 @@
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+        // 添加下面这两个仓库，给服务器指明下载 Xposed API 的路
+        maven { url "https://api.xposed.info/" }
+        jcenter()
+    }
+}
+rootProject.name = "PillDT2L"
+include ':app'
