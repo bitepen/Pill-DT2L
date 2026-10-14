@@ -2,14 +2,20 @@ package com.lighty.pill.dt2l;
 
 import android.content.Context;
 import android.content.res.Resources;
+import android.graphics.RectF;
 import android.os.PowerManager;
 import android.os.SystemClock;
+import android.util.DisplayMetrics;
 import android.util.TypedValue;
 import android.view.HapticFeedbackConstants;
+import android.view.InputEvent;
+import android.view.InputEventReceiver;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
+
+import java.lang.ref.WeakReference;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -22,14 +28,13 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String TAG = "PillDT2L";
     private static final String SYSTEMUI_PACKAGE = "com.android.systemui";
 
-    // 状态机枚举
     private static final int STATE_IDLE = 0;
     private static final int STATE_FIRST_DOWN = 1;
     private static final int STATE_WAIT_SECOND_DOWN = 2;
     private static final int STATE_SECOND_DOWN = 3;
 
-    // 单次点击最大持续时间（毫秒）：必须显著小于圈定即搜的长按阈值（400~500ms）
-    private static final long MAX_TAP_DURATION_MS = 250L;
+    // 单次点击最大按压时长（毫秒）：放宽到 280ms 保证手感，同时避开 400ms+ 的圈定即搜长按
+    private static final long MAX_TAP_DURATION_MS = 280L;
 
     private int mState = STATE_IDLE;
     private long mFirstDownTime = 0L;
@@ -41,12 +46,14 @@ public class MainHook implements IXposedHookLoadPackage {
     private float mSecondDownX = 0f;
     private float mSecondDownY = 0f;
 
-    // 防止同一事件重复分发
+    // 防止多个 InputChannel 重复派发同一个事件
     private int mLastAction = -1;
     private long mLastDownTime = -1L;
     private long mLastEventTime = -1L;
 
-    // 缓存的系统阈值与资源 ID（避免高频触摸时重复计算与分配内存）
+    private volatile Context mAppContext;
+    private WeakReference<ViewGroup> mNavBarRef = new WeakReference<>(null);
+
     private boolean mConfigInitialized = false;
     private float mTouchSlopSq = 0f;
     private float mDoubleTapSlopSq = 0f;
@@ -57,6 +64,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private int mHomeHandleResId = 0;
     private boolean mHomeHandleIdLookupDone = false;
     private final int[] mTempLocation = new int[2];
+    private final RectF mCachedPillBounds = new RectF();
 
     @Override
     public void handleLoadPackage(final LoadPackageParam lpparam) {
@@ -64,47 +72,75 @@ public class MainHook implements IXposedHookLoadPackage {
             return;
         }
 
-        // 优先查找 Android 15 QPR / 16 / 17 的路径，回退查找旧版 AOSP 路径
-        String[] candidateClasses = new String[]{
-                "com.android.systemui.navigationbar.views.NavigationBarFrame",
-                "com.android.systemui.navigationbar.NavigationBarFrame",
+        // 1. 获取全局 Context 兜底
+        try {
+            Class<?> appClass = XposedHelpers.findClassIfExists("android.app.Application", lpparam.classLoader);
+            if (appClass != null) {
+                XposedHelpers.findAndHookMethod(appClass, "onCreate", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        if (mAppContext == null && param.thisObject instanceof Context) {
+                            mAppContext = ((Context) param.thisObject).getApplicationContext();
+                            initConfigIfNeeded(mAppContext);
+                        }
+                    }
+                });
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": Failed to hook Application.onCreate: " + t.getMessage());
+        }
+
+        // 2. 捕获 NavigationBar 实例以实时定位 home_handle 小白条真实位置
+        String[] navBarClasses = new String[]{
                 "com.android.systemui.navigationbar.views.NavigationBarView",
-                "com.android.systemui.navigationbar.NavigationBarView"
+                "com.android.systemui.navigationbar.NavigationBarView",
+                "com.android.systemui.navigationbar.views.NavigationBarFrame",
+                "com.android.systemui.navigationbar.NavigationBarFrame"
         };
 
-        boolean hooked = false;
-        for (String className : candidateClasses) {
+        for (String className : navBarClasses) {
             Class<?> targetClass = XposedHelpers.findClassIfExists(className, lpparam.classLoader);
             if (targetClass != null) {
                 try {
-                    XposedHelpers.findAndHookMethod(
-                            targetClass,
-                            "dispatchTouchEvent",
-                            MotionEvent.class,
-                            new XC_MethodHook() {
-                                @Override
-                                protected void beforeHookedMethod(MethodHookParam param) {
-                                    if (!(param.thisObject instanceof ViewGroup)) {
-                                        return;
-                                    }
-                                    MotionEvent ev = (MotionEvent) param.args[0];
-                                    if (ev != null) {
-                                        observeTouchEvent((ViewGroup) param.thisObject, ev);
-                                    }
+                    XposedBridge.hookAllConstructors(targetClass, new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            if (param.thisObject instanceof ViewGroup) {
+                                ViewGroup vg = (ViewGroup) param.thisObject;
+                                mNavBarRef = new WeakReference<>(vg);
+                                if (mAppContext == null && vg.getContext() != null) {
+                                    mAppContext = vg.getContext().getApplicationContext();
+                                    initConfigIfNeeded(mAppContext);
                                 }
                             }
-                    );
-                    XposedBridge.log(TAG + ": Hooked dispatchTouchEvent on " + className);
-                    hooked = true;
-                    break;
+                        }
+                    });
+                    XposedBridge.log(TAG + ": Hooked constructor of " + className);
                 } catch (Throwable ignored) {
-                    // 若当前类未直接重写 dispatchTouchEvent，继续尝试下一个候选类
                 }
             }
         }
 
-        if (!hooked) {
-            XposedBridge.log(TAG + ": Failed to find suitable NavigationBar touch entry.");
+        // 3. 核心：Hook InputEventReceiver.dispatchInputEvent，确保拿到完整的 DOWN -> MOVE -> UP 序列
+        try {
+            XposedHelpers.findAndHookMethod(
+                    InputEventReceiver.class,
+                    "dispatchInputEvent",
+                    int.class,
+                    InputEvent.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            InputEvent event = (InputEvent) param.args[1];
+                            if (event instanceof MotionEvent) {
+                                observeMotionEvent((MotionEvent) event);
+                            }
+                        }
+                    }
+            );
+            XposedBridge.log(TAG + ": Successfully hooked InputEventReceiver.dispatchInputEvent");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": Failed to hook InputEventReceiver: " + t.getMessage());
         }
     }
 
@@ -113,29 +149,30 @@ public class MainHook implements IXposedHookLoadPackage {
             return;
         }
         ViewConfiguration vc = ViewConfiguration.get(context);
-        float touchSlop = vc.getScaledTouchSlop();
-        float doubleTapSlop = vc.getScaledDoubleTapSlop();
+        // 适当放宽一点单次点击的手指抖动容差（1.5 倍 TouchSlop），防止双击时轻微移位被误判为滑动
+        float touchSlop = vc.getScaledTouchSlop() * 1.5f;
+        float doubleTapSlop = vc.getScaledDoubleTapSlop() * 1.2f;
         mTouchSlopSq = touchSlop * touchSlop;
         mDoubleTapSlopSq = doubleTapSlop * doubleTapSlop;
         mDoubleTapTimeout = ViewConfiguration.getDoubleTapTimeout();
 
         Resources res = context.getResources();
         if (res != null) {
-            // 为小白条增加适度点击热区容差（横向 16dp，纵向 10dp）
+            // 小白条点击热区容差：横向扩充 28dp，纵向扩充 18dp（覆盖底部边缘极窄触控区）
             mHorizontalPaddingPx = TypedValue.applyDimension(
-                    TypedValue.COMPLEX_UNIT_DIP, 16f, res.getDisplayMetrics());
+                    TypedValue.COMPLEX_UNIT_DIP, 28f, res.getDisplayMetrics());
             mVerticalPaddingPx = TypedValue.applyDimension(
-                    TypedValue.COMPLEX_UNIT_DIP, 10f, res.getDisplayMetrics());
+                    TypedValue.COMPLEX_UNIT_DIP, 18f, res.getDisplayMetrics());
         }
         mConfigInitialized = true;
     }
 
-    private void observeTouchEvent(ViewGroup navBarRoot, MotionEvent ev) {
+    private void observeMotionEvent(MotionEvent ev) {
         int action = ev.getActionMasked();
         long downTime = ev.getDownTime();
         long eventTime = ev.getEventTime();
 
-        // 去重保护
+        // 去重：防止同一触摸事件被多个 InputMonitor 重复观察
         if (action == mLastAction && downTime == mLastDownTime && eventTime == mLastEventTime) {
             return;
         }
@@ -143,15 +180,22 @@ public class MainHook implements IXposedHookLoadPackage {
         mLastDownTime = downTime;
         mLastEventTime = eventTime;
 
-        initConfigIfNeeded(navBarRoot.getContext());
+        ViewGroup navBar = mNavBarRef.get();
+        Context ctx = mAppContext;
+        if (ctx == null && navBar != null) {
+            ctx = navBar.getContext();
+            if (ctx != null) {
+                mAppContext = ctx.getApplicationContext();
+            }
+        }
+        initConfigIfNeeded(ctx);
 
         float rawX = ev.getRawX();
         float rawY = ev.getRawY();
 
         switch (action) {
             case MotionEvent.ACTION_DOWN: {
-                boolean inPill = isTouchOnPill(navBarRoot, rawX, rawY);
-                if (!inPill) {
+                if (!isTouchOnPill(navBar, ctx, rawX, rawY)) {
                     resetState();
                     return;
                 }
@@ -159,7 +203,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 if (mState == STATE_WAIT_SECOND_DOWN) {
                     long interval = eventTime - mFirstUpTime;
                     float distSq = distanceSq(rawX, rawY, mFirstDownX, mFirstDownY);
-                    if (interval >= 0L && interval <= mDoubleTapTimeout && distSq <= mDoubleTapSlopSq) {
+                    if (interval >= 20L && interval <= mDoubleTapTimeout && distSq <= mDoubleTapSlopSq) {
                         mState = STATE_SECOND_DOWN;
                         mSecondDownTime = eventTime;
                         mSecondDownX = rawX;
@@ -168,7 +212,6 @@ public class MainHook implements IXposedHookLoadPackage {
                     }
                 }
 
-                // 作为第一次按下记录
                 mState = STATE_FIRST_DOWN;
                 mFirstDownTime = eventTime;
                 mFirstDownX = rawX;
@@ -180,7 +223,6 @@ public class MainHook implements IXposedHookLoadPackage {
                 if (mState == STATE_FIRST_DOWN) {
                     if ((eventTime - mFirstDownTime) > MAX_TAP_DURATION_MS
                             || distanceSq(rawX, rawY, mFirstDownX, mFirstDownY) > mTouchSlopSq) {
-                        // 发生滑动或长按，立即退出状态机，完全交给手势导航或圈定即搜
                         resetState();
                     }
                 } else if (mState == STATE_SECOND_DOWN) {
@@ -207,7 +249,8 @@ public class MainHook implements IXposedHookLoadPackage {
                     if (duration <= MAX_TAP_DURATION_MS
                             && distanceSq(rawX, rawY, mSecondDownX, mSecondDownY) <= mTouchSlopSq) {
                         resetState();
-                        triggerScreenLock(navBarRoot);
+                        XposedBridge.log(TAG + ": Double tap detected on pill, locking screen.");
+                        triggerScreenLock(navBar, ctx);
                     } else {
                         resetState();
                     }
@@ -218,7 +261,6 @@ public class MainHook implements IXposedHookLoadPackage {
             case MotionEvent.ACTION_CANCEL:
             case MotionEvent.ACTION_OUTSIDE:
             case MotionEvent.ACTION_POINTER_DOWN: {
-                // 系统接管手势或多指触控时立即清空状态
                 resetState();
                 break;
             }
@@ -228,56 +270,71 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private boolean isTouchOnPill(ViewGroup navBarRoot, float rawX, float rawY) {
-        if (!mHomeHandleIdLookupDone) {
-            Resources res = navBarRoot.getResources();
-            if (res != null) {
-                mHomeHandleResId = res.getIdentifier("home_handle", "id", SYSTEMUI_PACKAGE);
-            }
-            mHomeHandleIdLookupDone = true;
-        }
-
-        if (mHomeHandleResId != 0) {
-            View handleView = navBarRoot.findViewById(mHomeHandleResId);
-            if (handleView != null) {
-                // 如果小白条不可见（如处于三键导航模式），则不响应
-                if (!handleView.isShown() || handleView.getWidth() <= 0 || handleView.getHeight() <= 0) {
-                    return false;
+    private boolean isTouchOnPill(ViewGroup navBarRoot, Context ctx, float rawX, float rawY) {
+        // 1. 尝试从 NavigationBarView 的 home_handle 获取精准坐标
+        if (navBarRoot != null) {
+            if (!mHomeHandleIdLookupDone) {
+                Resources res = navBarRoot.getResources();
+                if (res != null) {
+                    mHomeHandleResId = res.getIdentifier("home_handle", "id", SYSTEMUI_PACKAGE);
                 }
-                handleView.getLocationOnScreen(mTempLocation);
-                float left = mTempLocation[0] - mHorizontalPaddingPx;
-                float top = mTempLocation[1] - mVerticalPaddingPx;
-                float right = mTempLocation[0] + handleView.getWidth() + mHorizontalPaddingPx;
-                float bottom = mTempLocation[1] + handleView.getHeight() + mVerticalPaddingPx;
-                return rawX >= left && rawX <= right && rawY >= top && rawY <= bottom;
+                mHomeHandleIdLookupDone = true;
+            }
+
+            if (mHomeHandleResId != 0) {
+                View handleView = navBarRoot.findViewById(mHomeHandleResId);
+                if (handleView != null && handleView.isShown()
+                        && handleView.getWidth() > 0 && handleView.getHeight() > 0) {
+                    handleView.getLocationOnScreen(mTempLocation);
+                    float left = mTempLocation[0] - mHorizontalPaddingPx;
+                    float top = mTempLocation[1] - mVerticalPaddingPx;
+                    float right = mTempLocation[0] + handleView.getWidth() + mHorizontalPaddingPx;
+                    float bottom = mTempLocation[1] + handleView.getHeight() + mVerticalPaddingPx;
+                    mCachedPillBounds.set(left, top, right, bottom);
+                    return mCachedPillBounds.contains(rawX, rawY);
+                }
             }
         }
 
-        // 兜底逻辑：如果找不到 home_handle 控件，则取导航栏居中 36% 区域
-        if (navBarRoot.getWidth() <= 0 || navBarRoot.getHeight() <= 0) {
-            return false;
+        // 2. 如果之前缓存过有效的小白条位置，优先使用缓存
+        if (!mCachedPillBounds.isEmpty()) {
+            return mCachedPillBounds.contains(rawX, rawY);
         }
-        navBarRoot.getLocationOnScreen(mTempLocation);
-        float rootWidth = navBarRoot.getWidth();
-        float left = mTempLocation[0] + rootWidth * 0.32f;
-        float right = mTempLocation[0] + rootWidth * 0.68f;
-        float top = mTempLocation[1] - mVerticalPaddingPx;
-        float bottom = mTempLocation[1] + navBarRoot.getHeight() + mVerticalPaddingPx;
-        return rawX >= left && rawX <= right && rawY >= top && rawY <= bottom;
+
+        // 3. 终极兜底：根据当前屏幕尺寸计算底部居中小白条热区（宽度居中 30% ~ 70%，底部高度 36dp 内）
+        if (ctx != null && ctx.getResources() != null) {
+            DisplayMetrics dm = ctx.getResources().getDisplayMetrics();
+            float screenW = dm.widthPixels;
+            float screenH = dm.heightPixels;
+            float bottomZoneHeight = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 36f, dm);
+
+            float left = screenW * 0.30f;
+            float right = screenW * 0.70f;
+            float top = screenH - bottomZoneHeight;
+            float bottom = screenH;
+            return rawX >= left && rawX <= right && rawY >= top && rawY <= bottom;
+        }
+
+        return false;
     }
 
-    private void triggerScreenLock(View view) {
-        try {
-            view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK);
-        } catch (Throwable ignored) {
+    private void triggerScreenLock(View view, Context ctx) {
+        if (view != null) {
+            try {
+                view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK);
+            } catch (Throwable ignored) {
+            }
         }
 
-        Context context = view.getContext();
-        if (context == null) {
+        if (ctx == null && view != null) {
+            ctx = view.getContext();
+        }
+        if (ctx == null) {
+            XposedBridge.log(TAG + ": Cannot lock screen because Context is null.");
             return;
         }
 
-        PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
         if (pm == null) {
             return;
         }
@@ -287,7 +344,6 @@ public class MainHook implements IXposedHookLoadPackage {
             XposedHelpers.callMethod(pm, "goToSleep", now);
         } catch (Throwable t1) {
             try {
-                // 兼容三参数重载 goToSleep(long time, int reason, int flags)
                 XposedHelpers.callMethod(pm, "goToSleep", now, 4, 0);
             } catch (Throwable t2) {
                 XposedBridge.log(TAG + ": Failed to call goToSleep: " + t2.getMessage());
