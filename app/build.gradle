@@ -4,11 +4,12 @@ plugins {
 
 android {
     namespace 'com.lighty.pill.dt2l'
-    compileSdk 37
+    compileSdk 35
 
     defaultConfig {
         applicationId "com.lighty.pill.dt2l"
         minSdk 31
+        // 保持 targetSdk 为 37，打包出来的 APK 目标 API 就是 37
         targetSdk 37
         versionCode 1
         versionName "1.0.0"
