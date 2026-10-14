@@ -1,8 +1,10 @@
 package com.lighty.pill.dt2l;
 
 import android.content.Context;
+import android.content.res.Configuration;
 import android.content.res.Resources;
 import android.graphics.RectF;
+import android.os.Bundle;
 import android.os.PowerManager;
 import android.os.SystemClock;
 import android.util.DisplayMetrics;
@@ -32,6 +34,9 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final int STATE_WAIT_SECOND_DOWN = 2;
     private static final int STATE_SECOND_DOWN = 3;
 
+    // PowerManager.GO_TO_SLEEP_REASON_POWER_BUTTON = 4
+    private static final int GO_TO_SLEEP_REASON_POWER_BUTTON = 4;
+
     // 单次点击最大按压时长（毫秒）：280ms 兼顾手感与防误触，且远小于圈定即搜 400ms+ 的长按阈值
     private static final long MAX_TAP_DURATION_MS = 280L;
 
@@ -57,7 +62,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private float mTouchSlopSq = 0f;
     private float mDoubleTapSlopSq = 0f;
     private long mDoubleTapTimeout = 300L;
-    private float mHorizontalPaddingPx = 0f;
+    private float mPillVisualHalfWidthPx = 0f;
     private float mVerticalPaddingPx = 0f;
 
     private int mHomeHandleResId = 0;
@@ -159,8 +164,6 @@ public class MainHook implements IXposedHookLoadPackage {
                     }
                 });
                 XposedBridge.log(TAG + ": Hooked InputEventReceiver.dispatchInputEvent");
-            } else {
-                XposedBridge.log(TAG + ": InputEventReceiver class not found");
             }
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": Failed to hook InputEventReceiver: " + t.getMessage());
@@ -183,7 +186,6 @@ public class MainHook implements IXposedHookLoadPackage {
             return;
         }
         ViewConfiguration vc = ViewConfiguration.get(context);
-        // 放宽 1.5 倍单次点击防抖容差，避免双击时轻微晃动被误判为滑动
         float touchSlop = vc.getScaledTouchSlop() * 1.5f;
         float doubleTapSlop = vc.getScaledDoubleTapSlop() * 1.2f;
         mTouchSlopSq = touchSlop * touchSlop;
@@ -192,11 +194,23 @@ public class MainHook implements IXposedHookLoadPackage {
 
         Resources res = context.getResources();
         if (res != null) {
-            // 小白条点击热区容差：横向扩充 32dp，纵向扩充 20dp
-            mHorizontalPaddingPx = TypedValue.applyDimension(
-                    TypedValue.COMPLEX_UNIT_DIP, 32f, res.getDisplayMetrics());
-            mVerticalPaddingPx = TypedValue.applyDimension(
-                    TypedValue.COMPLEX_UNIT_DIP, 20f, res.getDisplayMetrics());
+            DisplayMetrics dm = res.getDisplayMetrics();
+            // 读取系统小白条真实绘制宽度（通常为 108dp），不再额外加横向 Padding，严格对齐白条视觉边缘
+            float pillWidthPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 108f, dm);
+            int widthDimenId = res.getIdentifier("navigation_home_handle_width", "dimen", SYSTEMUI_PACKAGE);
+            if (widthDimenId != 0) {
+                try {
+                    float sysPillWidth = res.getDimension(widthDimenId);
+                    if (sysPillWidth > 0f) {
+                        pillWidthPx = sysPillWidth;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+            mPillVisualHalfWidthPx = pillWidthPx * 0.5f;
+
+            // 纵向容差保持 20dp 不变
+            mVerticalPaddingPx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 20f, dm);
         }
         mConfigInitialized = true;
     }
@@ -283,7 +297,7 @@ public class MainHook implements IXposedHookLoadPackage {
                     if (duration <= MAX_TAP_DURATION_MS
                             && distanceSq(rawX, rawY, mSecondDownX, mSecondDownY) <= mTouchSlopSq) {
                         resetState();
-                        XposedBridge.log(TAG + ": Double tap detected on pill, locking screen.");
+                        XposedBridge.log(TAG + ": Double tap detected on pill, locking screen immediately.");
                         triggerScreenLock(navBar, ctx);
                     } else {
                         resetState();
@@ -305,7 +319,20 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     private boolean isTouchOnPill(ViewGroup navBarRoot, Context ctx, float rawX, float rawY) {
-        // 1. 尝试从 NavigationBar 的 home_handle 获取精准坐标
+        // 竖屏下严格限制横向范围在屏幕居中的 38% ~ 62% 之间，防止点击小白条左右两侧空白处误触发
+        if (ctx != null && ctx.getResources() != null) {
+            Resources res = ctx.getResources();
+            DisplayMetrics dm = res.getDisplayMetrics();
+            if (res.getConfiguration().orientation == Configuration.ORIENTATION_PORTRAIT) {
+                float minX = dm.widthPixels * 0.38f;
+                float maxX = dm.widthPixels * 0.62f;
+                if (rawX < minX || rawX > maxX) {
+                    return false;
+                }
+            }
+        }
+
+        // 1. 尝试从 NavigationBar 的 home_handle 获取中心位置，并严格按小白条视觉宽度裁剪
         if (navBarRoot != null) {
             if (!mHomeHandleIdLookupDone) {
                 Resources res = navBarRoot.getResources();
@@ -320,32 +347,35 @@ public class MainHook implements IXposedHookLoadPackage {
                 if (handleView != null && handleView.isShown()
                         && handleView.getWidth() > 0 && handleView.getHeight() > 0) {
                     handleView.getLocationOnScreen(mTempLocation);
-                    float left = mTempLocation[0] - mHorizontalPaddingPx;
+                    float centerX = mTempLocation[0] + handleView.getWidth() * 0.5f;
+                    float halfW = mPillVisualHalfWidthPx > 0f
+                            ? mPillVisualHalfWidthPx
+                            : handleView.getWidth() * 0.35f;
+
+                    float left = centerX - halfW;
+                    float right = centerX + halfW;
                     float top = mTempLocation[1] - mVerticalPaddingPx;
-                    float right = mTempLocation[0] + handleView.getWidth() + mHorizontalPaddingPx;
                     float bottom = mTempLocation[1] + handleView.getHeight() + mVerticalPaddingPx;
                     mCachedPillBounds.set(left, top, right, bottom);
-                    if (mCachedPillBounds.contains(rawX, rawY)) {
-                        return true;
-                    }
+                    return mCachedPillBounds.contains(rawX, rawY);
                 }
             }
         }
 
         // 2. 尝试匹配已缓存的小白条位置
-        if (!mCachedPillBounds.isEmpty() && mCachedPillBounds.contains(rawX, rawY)) {
-            return true;
+        if (!mCachedPillBounds.isEmpty()) {
+            return mCachedPillBounds.contains(rawX, rawY);
         }
 
-        // 3. 屏幕底部中心区域兜底（宽度居中 28% ~ 72%，底部高度 42dp 内）
+        // 3. 屏幕底部中心区域兜底（宽度严格居中 38% ~ 62%，底部高度 42dp 内）
         if (ctx != null && ctx.getResources() != null) {
             DisplayMetrics dm = ctx.getResources().getDisplayMetrics();
             float screenW = dm.widthPixels;
             float screenH = dm.heightPixels;
             float bottomZoneHeight = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 42f, dm);
 
-            float left = screenW * 0.28f;
-            float right = screenW * 0.72f;
+            float left = screenW * 0.38f;
+            float right = screenW * 0.62f;
             float top = screenH - bottomZoneHeight;
             float bottom = screenH;
             return rawX >= left && rawX <= right && rawY >= top && rawY <= bottom;
@@ -370,6 +400,21 @@ public class MainHook implements IXposedHookLoadPackage {
             return;
         }
 
+        // 第一步：通知 WindowManager 立即上锁 Keyguard（与系统无障碍锁屏同源，保留指纹解锁）
+        try {
+            ClassLoader cl = ctx.getClassLoader();
+            Class<?> wmgClass = XposedHelpers.findClassIfExists("android.view.WindowManagerGlobal", cl);
+            if (wmgClass != null) {
+                Object wms = XposedHelpers.callStaticMethod(wmgClass, "getWindowManagerService");
+                if (wms != null) {
+                    XposedHelpers.callMethod(wms, "lockNow", new Class<?>[]{Bundle.class}, (Object) null);
+                }
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": Failed to call WindowManager.lockNow: " + t.getMessage());
+        }
+
+        // 第二步：以按下电源键的原因 (GO_TO_SLEEP_REASON_POWER_BUTTON = 4) 立即熄屏休眠
         PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
         if (pm == null) {
             return;
@@ -377,10 +422,17 @@ public class MainHook implements IXposedHookLoadPackage {
 
         long now = SystemClock.uptimeMillis();
         try {
-            XposedHelpers.callMethod(pm, "goToSleep", now);
+            XposedHelpers.callMethod(
+                    pm,
+                    "goToSleep",
+                    new Class<?>[]{long.class, int.class, int.class},
+                    now,
+                    GO_TO_SLEEP_REASON_POWER_BUTTON,
+                    0
+            );
         } catch (Throwable t1) {
             try {
-                XposedHelpers.callMethod(pm, "goToSleep", now, 4, 0);
+                XposedHelpers.callMethod(pm, "goToSleep", now);
             } catch (Throwable t2) {
                 XposedBridge.log(TAG + ": Failed to call goToSleep: " + t2.getMessage());
             }
